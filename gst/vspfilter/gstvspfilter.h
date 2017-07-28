@@ -131,6 +131,8 @@ struct _GstVspFilter {
   GstBufferPool *out_pool;
   GstVspfilterIOMode prop_in_mode;
   GstVspfilterIOMode prop_out_mode;
+  gboolean vflip;
+  gboolean hflip;
 };
 
 struct _GstVspFilterClass
