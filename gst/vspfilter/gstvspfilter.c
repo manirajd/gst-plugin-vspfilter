@@ -46,6 +46,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "csc_matrix.h"
+
 GST_DEBUG_CATEGORY (vspfilter_debug);
 #define GST_CAT_DEFAULT vspfilter_debug
 GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
@@ -67,6 +69,32 @@ enum
   PROP_OUTPUT_IO_MODE,
   PROP_VFLIP,
   PROP_HFLIP,
+  PROP_HUE,
+  PROP_SATURATION,
+  PROP_BRIGHTNESS,
+  PROP_CONTRAST,
+  PROP_HUE_OFFSET,
+  PROP_SATURATION_OFFSET,
+  PROP_BRIGHTNESS_OFFSET,
+};
+
+typedef struct CpropCaps_t
+{
+  gint min;
+  gint max;
+}CpropCaps;
+
+/*Insert enums carefully between PROP_HUE and PROP_BRIGHTNESS_OFFSET
+ * as it is used as an array index*/
+static const CpropCaps color_prop_caps[(PROP_BRIGHTNESS_OFFSET - PROP_HUE) + 1] =
+{
+  {-180, 180},
+  {0, 200},
+  {0, 200},
+  {0, 200},
+  {-180, 180},
+  {0, 100},
+  {-100, 100}
 };
 
 #define CSP_VIDEO_CAPS \
@@ -1728,6 +1756,48 @@ gst_vsp_filter_class_init (GstVspFilterClass * klass)
           GST_TYPE_VSPFILTER_IO_MODE, DEFAULT_PROP_IO_MODE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_HUE,
+      g_param_spec_int("hue", "hue",
+          "color space rotation angle",
+          color_prop_caps[0].min, color_prop_caps[0].max, DEFAULT_HUE,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_SATURATION,
+      g_param_spec_int("saturation", "saturation",
+          "saturation as defined by HSV color space",
+          color_prop_caps[1].min, color_prop_caps[1].max, DEFAULT_SATURATION,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_BRIGHTNESS,
+      g_param_spec_int("brightness", "brightness",
+          "Brightness as defined by value in HSV color space",
+          color_prop_caps[2].min, color_prop_caps[2].max, DEFAULT_BRIGHTNESS,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_CONTRAST,
+      g_param_spec_int("contrast", "contrast",
+          "contrast is the extent one can distinguish colors",
+          color_prop_caps[3].min, color_prop_caps[3].max, DEFAULT_CONTRAST,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_HUE_OFFSET,
+      g_param_spec_int("hue offset", "hue offset",
+          "hue value for the color offset which is added to each pixel",
+          color_prop_caps[4].min, color_prop_caps[4].max, DEFAULT_HUE_OFFSET,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_SATURATION_OFFSET,
+      g_param_spec_int("saturation offset", "saturation offset",
+          "saturation value for the color offset which is added to each pixel",
+          color_prop_caps[5].min, color_prop_caps[5].max, DEFAULT_SATURATION_OFFSET,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_BRIGHTNESS_OFFSET,
+      g_param_spec_int("brightness offset", "brightness offset",
+          "brightness value for the color offset which is added to each pixel",
+          color_prop_caps[6].min, color_prop_caps[6].max, DEFAULT_BRIGHTNESS_OFFSET,
+          G_PARAM_READWRITE));
+
   g_object_class_install_property (gobject_class, PROP_VFLIP,
          g_param_spec_boolean("vflip", "vflip",
              "Perform vertical flip (around X axis)",
@@ -1790,7 +1860,29 @@ gst_vsp_filter_init (GstVspFilter * space)
 
   vsp_info->resz_subdev_fd = -1;
 
+  vsp_info->CProps.hue  = DEFAULT_HUE;
+  vsp_info->CProps.saturation = DEFAULT_SATURATION;
+  vsp_info->CProps.brightness = DEFAULT_BRIGHTNESS;
+  vsp_info->CProps.contrast = DEFAULT_CONTRAST;
+  vsp_info->CProps.hue_offset = DEFAULT_HUE_OFFSET;
+  vsp_info->CProps.saturation_offset = DEFAULT_SATURATION_OFFSET;
+  vsp_info->CProps.brightness_offset = DEFAULT_BRIGHTNESS_OFFSET;
+
   space->vsp_info = vsp_info;
+}
+
+static gint gst_v4l_csc_get_capped_color_prop(gint property, gint value)
+{
+  gint ret = value;
+  if (value < color_prop_caps[property - PROP_HUE].min)
+  {
+    ret = color_prop_caps[property - PROP_HUE].min;
+  }
+  if (value > color_prop_caps[property - PROP_HUE].max)
+  {
+    ret = color_prop_caps[property - PROP_HUE].max;
+  }
+  return ret;
 }
 
 static void
@@ -1828,9 +1920,42 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
     case PROP_HFLIP:
       space->hflip = g_value_get_boolean(value);
       break;
+    case PROP_HUE:
+      vsp_info->CProps.hue = \
+         gst_v4l_csc_get_capped_color_prop(PROP_HUE,g_value_get_int(value));
+      break;
+    case PROP_SATURATION:
+      vsp_info->CProps.saturation = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_SATURATION,g_value_get_int(value));
+      break;
+    case PROP_BRIGHTNESS:
+      vsp_info->CProps.brightness = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_BRIGHTNESS,g_value_get_int(value));
+      break;
+    case PROP_CONTRAST:
+      vsp_info->CProps.contrast = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_CONTRAST,g_value_get_int(value));
+      break;
+    case PROP_HUE_OFFSET:
+      vsp_info->CProps.hue_offset = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_HUE_OFFSET,g_value_get_int(value));
+      break;
+    case PROP_SATURATION_OFFSET:
+      vsp_info->CProps.saturation_offset = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_SATURATION_OFFSET,g_value_get_int(value));
+      break;
+    case PROP_BRIGHTNESS_OFFSET:
+      vsp_info->CProps.brightness_offset = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_BRIGHTNESS_OFFSET,g_value_get_int(value));
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
+  }
+
+  if ((property_id >= PROP_HUE) && (property_id <= PROP_BRIGHTNESS_OFFSET))
+  {
+      vsp_info->CProps.update_cprops = TRUE;
   }
 }
 
@@ -1862,6 +1987,27 @@ gst_vsp_filter_get_property (GObject * object, guint property_id,
       break;
     case PROP_HFLIP:
       g_value_set_boolean(value, space->hflip);
+      break;
+    case PROP_HUE:
+      g_value_set_int(value, vsp_info->CProps.hue);
+      break;
+    case PROP_SATURATION:
+      g_value_set_int(value, (gint)vsp_info->CProps.saturation);
+      break;
+    case PROP_BRIGHTNESS:
+      g_value_set_int(value, (gint)vsp_info->CProps.brightness);
+      break;
+    case PROP_CONTRAST:
+      g_value_set_int(value, (gint)vsp_info->CProps.contrast);
+      break;
+    case PROP_HUE_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.hue_offset);
+      break;
+    case PROP_SATURATION_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.saturation_offset);
+      break;
+    case PROP_BRIGHTNESS_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.brightness_offset);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);

@@ -61,6 +61,14 @@ G_BEGIN_DECLS
 #define DEFAULT_PROP_VSP_DEVFILE_INPUT "/dev/video0"
 #define DEFAULT_PROP_VSP_DEVFILE_OUTPUT "/dev/video1"
 
+#define DEFAULT_HUE                 0
+#define DEFAULT_SATURATION          100
+#define DEFAULT_BRIGHTNESS          100
+#define DEFAULT_CONTRAST            100
+#define DEFAULT_HUE_OFFSET          0
+#define DEFAULT_SATURATION_OFFSET   0
+#define DEFAULT_BRIGHTNESS_OFFSET   0
+
 typedef enum {
   GST_VSPFILTER_IO_AUTO = 0, /* dmabuf or mmap */
   GST_VSPFILTER_IO_USERPTR,
@@ -106,6 +114,7 @@ struct _GstVspFilterVspInfo {
   gboolean already_device_initialized[MAX_DEVICES];
   gboolean already_setup_info;
   guint16 plane_stride[MAX_DEVICES][VIDEO_MAX_PLANES];
+  ColorProps CProps;
 };
 
 union _GstVspFilterFrame {
