@@ -41,6 +41,8 @@
 #include <linux/v4l2-subdev.h>
 #include <linux/v4l2-mediabus.h>
 
+#include "csc_matrix.h"
+
 G_BEGIN_DECLS
 
 #define GST_TYPE_VSP_FILTER	          (gst_vsp_filter_get_type())
@@ -53,7 +55,7 @@ G_BEGIN_DECLS
 #define N_BUFFERS 1
 
 #define MAX_DEVICES 2
-#define MAX_ENTITIES 4
+#define MAX_ENTITIES 5
 
 #define VSP_CONF_ITEM_INPUT "input-device-name="
 #define VSP_CONF_ITEM_OUTPUT "output-device-name="
@@ -68,6 +70,9 @@ G_BEGIN_DECLS
 #define DEFAULT_HUE_OFFSET          0
 #define DEFAULT_SATURATION_OFFSET   0
 #define DEFAULT_BRIGHTNESS_OFFSET   0
+
+#define RCAR_CLU_NUM (17*17*17)
+#define RCAR_CLU_NUM_PER_COLOR 17
 
 typedef enum {
   GST_VSPFILTER_IO_AUTO = 0, /* dmabuf or mmap */
@@ -92,6 +97,7 @@ enum {
   OUT = 0,
   CAP = 1,
   RESZ = 2,
+  CLU = 3,
 };
 
 struct _GstVspFilterVspInfo {
@@ -104,6 +110,7 @@ struct _GstVspFilterVspInfo {
   gint media_fd;
   gint v4lsub_fd[MAX_DEVICES];
   gint resz_subdev_fd;
+  gint clu_subdev_fd;
   guint format[MAX_DEVICES];
   enum v4l2_mbus_pixelcode code[MAX_DEVICES];
   guint n_planes[MAX_DEVICES];
@@ -115,6 +122,7 @@ struct _GstVspFilterVspInfo {
   gboolean already_setup_info;
   guint16 plane_stride[MAX_DEVICES][VIDEO_MAX_PLANES];
   ColorProps CProps;
+  guint64* clut_addr;
 };
 
 union _GstVspFilterFrame {

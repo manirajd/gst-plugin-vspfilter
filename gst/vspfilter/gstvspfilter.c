@@ -46,7 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "csc_matrix.h"
+#include "vsp2.h"
 
 GST_DEBUG_CATEGORY (vspfilter_debug);
 #define GST_CAT_DEFAULT vspfilter_debug
@@ -738,6 +738,188 @@ leave:
   return ret;
 }
 
+static enum csc_type
+get_csc_type (GstVspFilter * space, guint src_format, guint sink_format)
+{
+  enum csc_type csc_conversion;
+
+  GST_DEBUG_OBJECT(space, "src_format: %d, sink_format:%d\n", src_format, sink_format);
+
+  if (((V4L2_PIX_FMT_YUV420M == src_format)
+      || (V4L2_PIX_FMT_NV12M == src_format)
+      || (V4L2_PIX_FMT_NV21M == src_format)
+      || (V4L2_PIX_FMT_NV16M == src_format)
+      || (V4L2_PIX_FMT_UYVY == src_format)
+      || (V4L2_PIX_FMT_YUYV == src_format)) &&
+      ((V4L2_PIX_FMT_RGB565 == sink_format)
+      || (V4L2_PIX_FMT_RGB24 == sink_format)
+      || (V4L2_PIX_FMT_BGR24 == sink_format)
+      || (V4L2_PIX_FMT_ARGB32 == sink_format)
+      || (V4L2_PIX_FMT_XRGB32 == sink_format)
+      || (V4L2_PIX_FMT_ABGR32 == sink_format)
+      || (V4L2_PIX_FMT_XBGR32 == sink_format)))
+  {
+    csc_conversion = CSC_RGB2YUV;
+  }
+  else if(((V4L2_PIX_FMT_YUV420M == sink_format)
+          || (V4L2_PIX_FMT_NV12M == sink_format)
+          || (V4L2_PIX_FMT_NV21M == sink_format)
+          || (V4L2_PIX_FMT_NV16M == sink_format)
+          || (V4L2_PIX_FMT_UYVY == sink_format)
+          || (V4L2_PIX_FMT_YUYV == sink_format)) &&
+          ((V4L2_PIX_FMT_RGB565 == src_format)
+          || (V4L2_PIX_FMT_RGB24 == src_format)
+          || (V4L2_PIX_FMT_BGR24 == src_format)
+          || (V4L2_PIX_FMT_ARGB32 == src_format)
+          || (V4L2_PIX_FMT_XRGB32 == src_format)
+          || (V4L2_PIX_FMT_ABGR32 == src_format)
+          || (V4L2_PIX_FMT_XBGR32 == src_format)))
+  {
+    csc_conversion = CSC_YUV2RGB;
+  }
+  else if ((V4L2_PIX_FMT_RGB565 == src_format)
+           || (V4L2_PIX_FMT_RGB24 == src_format)
+           || (V4L2_PIX_FMT_BGR24 == src_format)
+           || (V4L2_PIX_FMT_ARGB32 == src_format)
+           || (V4L2_PIX_FMT_XRGB32 == src_format)
+           || (V4L2_PIX_FMT_ABGR32 == src_format)
+           || (V4L2_PIX_FMT_XBGR32 == src_format))
+  {
+    csc_conversion = CSC_RGB2RGB;
+  }
+  else
+  {
+    csc_conversion = CSC_YUV2YUV;
+  }
+
+  return csc_conversion;
+}
+
+static gboolean
+set_clu_matrix (GstVspFilter * space)
+{
+  GstVspFilterVspInfo *vsp_info;
+
+  enum csc_type type;
+  float coefficients[9];
+  int i,j,k=0;
+  int b_loop;
+  int g_loop;
+  int r_loop;
+  uint32_t r_value;
+  uint32_t g_value;
+  uint32_t b_value;
+  uint32_t clu_color;
+  guint64* clut_addr;
+  struct vsp2_clu_config clu_config = {0};
+  float trnfmat[4][4]= {{1.0, 0.0, 0.0, 0.0},
+                        {0.0, 1.0, 0.0, 0.0},
+                        {0.0, 0.0, 1.0, 0.0},
+                        {0.0, 0.0, 0.0, 1.0}};
+
+  vsp_info = space->vsp_info;
+
+  type = get_csc_type(space, vsp_info->format[CAP], vsp_info->format[OUT]);
+
+  csc_GetTransformationMatrix(0, type, &vsp_info->CProps, trnfmat);
+
+  for (i = 0; i < 3; i++) {
+    for (j = 0; j < 3; j++) {
+      //column major
+      coefficients[k] = trnfmat[j][i];
+      ++k;
+    }
+  }
+
+  clut_addr = vsp_info->clut_addr;
+
+  for (b_loop = 0; b_loop < RCAR_CLU_NUM_PER_COLOR; b_loop++) {
+    for (g_loop = 0; g_loop < RCAR_CLU_NUM_PER_COLOR; g_loop++) {
+      for (r_loop = 0; r_loop < RCAR_CLU_NUM_PER_COLOR; r_loop++) {
+        r_value = (r_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : r_loop * 16;
+        g_value = (g_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : g_loop * 16;
+        b_value = (b_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : b_loop * 16;
+
+        clu_color =
+          (guint32)( ((r_value*coefficients[0]) + (g_value*coefficients[1]) + (b_value*coefficients[2])) + 0.5) << 16 |
+          ((guint32) (((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5])) + 0.5) << 8) |
+          ((guint32) ( (r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5) );
+
+        *(clut_addr) = (guint64)clu_color;
+        clut_addr++;
+      }
+    }
+  }
+
+  clu_config.addr = vsp_info->clut_addr;
+  clu_config.mode = 0 /*VSP_CLU_MODE_3D*/;
+  clu_config.tbl_num = RCAR_CLU_NUM;
+
+  if (-1 == ioctl (vsp_info->clu_subdev_fd, VIDIOC_VSP2_CLU_CONFIG, &clu_config)) {
+    GST_ERROR_OBJECT (space, "VIDIOC_VSP2_CLU_CONFIG failed");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+set_clu_entity (GstVspFilter * space, const gchar *clu_entity_name,
+                gint in_width, gint in_height,
+                gint out_width, gint out_height)
+{
+  GstVspFilterVspInfo *vsp_info;
+  gchar path[256];
+  gchar tmp[256];
+  gint ret;
+
+  vsp_info = space->vsp_info;
+
+  if (vsp_info->clu_subdev_fd < 0) {
+    vsp_info->clu_subdev_fd =
+        open_v4lsubdev (vsp_info->ip_name, clu_entity_name, path);
+    if (vsp_info->clu_subdev_fd < 0) {
+      GST_ERROR_OBJECT (space, "cannot open a subdev file for %s",
+          clu_entity_name);
+      return FALSE;
+    }
+  }
+
+  sprintf (tmp, "%s %s", vsp_info->ip_name, clu_entity_name);
+  ret = get_media_entity (space, tmp, &vsp_info->entity[CLU]);
+  if (ret < 0) {
+    GST_ERROR_OBJECT (space, "Entity for %s not found.", clu_entity_name);
+    return FALSE;
+  }
+  GST_DEBUG_OBJECT (space, "A entity for %s found.", clu_entity_name);
+
+  ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CLU]);
+  if (ret) {
+    GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+        vsp_info->entity_name[OUT], clu_entity_name);
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+    vsp_info->entity_name[OUT], clu_entity_name);
+
+  /*sink pad*/
+  if (!init_entity_pad (space, vsp_info->clu_subdev_fd, CLU, 0, in_width,
+      in_height, vsp_info->code[OUT])) {
+    GST_ERROR_OBJECT (space, "init_entity_pad failed");
+    return FALSE;
+  }
+
+  /*source pad*/
+  if (!init_entity_pad (space, vsp_info->clu_subdev_fd, CLU, 1, out_width,
+      out_height, vsp_info->code[CAP])) {
+    GST_ERROR_OBJECT (space, "init_entity_pad failed");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 static gboolean
 set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     gint in_height, gint in_stride[GST_VIDEO_MAX_PLANES],
@@ -749,6 +931,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   gint ret;
   gchar tmp[256];
   guint n_bufs;
+  const gchar *clu_entity_name = "clu";
 
   vsp_info = space->vsp_info;
 
@@ -822,6 +1005,13 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   /* Deactivate the current pipeline. */
   deactivate_link (space, &vsp_info->entity[OUT]);
 
+  ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
+          out_width, out_height);
+  if (FALSE == ret) {
+    GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
+    return FALSE;
+  }
+
   GST_DEBUG_OBJECT (space,
       "in_info->width=%d in_info->height=%d out_info->width=%d out_info->height=%d",
       in_width, in_height, out_width, out_height);
@@ -849,15 +1039,15 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     }
     GST_DEBUG_OBJECT (space, "A entity for %s found.", resz_entity_name);
     ret =
-        activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[RESZ]);
+        activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[RESZ]);
     if (ret) {
       GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
-          vsp_info->entity_name[OUT], resz_entity_name);
+          clu_entity_name, resz_entity_name);
       return FALSE;
     }
 
     GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        vsp_info->entity_name[OUT], resz_entity_name);
+        clu_entity_name, resz_entity_name);
 
     ret =
         activate_link (space, &vsp_info->entity[RESZ], &vsp_info->entity[CAP]);
@@ -886,22 +1076,22 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
       vsp_info->resz_subdev_fd = -1;
     }
 
-    ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CAP]);
+    ret = activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[CAP]);
     if (ret) {
       GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
-          vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+          vsp_info->entity_name[CLU], vsp_info->entity_name[CAP]);
       return FALSE;
     }
     GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+        vsp_info->entity_name[CLU], vsp_info->entity_name[CAP]);
   }
 
   if (!get_wpf_output_entity_name (space, tmp, sizeof (tmp))) {
     GST_ERROR_OBJECT (space, "get_wpf_output_entity_name failed");
     return FALSE;
   }
-  ret = get_media_entity (space, tmp, &vsp_info->entity[3]);
-  ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[3]);
+  ret = get_media_entity (space, tmp, &vsp_info->entity[4]);
+  ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[4]);
   if (ret) {
     GST_ERROR_OBJECT (space,
         "Cannot enable a link from %s to vsp1.2 wpf.0 output",
@@ -919,7 +1109,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   }
   /* source pad in RPF */
   if (!init_entity_pad (space, vsp_info->v4lsub_fd[OUT], OUT, 1, in_width,
-          in_height, vsp_info->code[CAP])) {
+          in_height, vsp_info->code[OUT])) {
     GST_ERROR_OBJECT (space, "init_entity_pad failed");
     return FALSE;
   }
@@ -982,6 +1172,7 @@ gst_vsp_filter_finalize (GObject * obj)
   g_free (vsp_info->dev_name[OUT]);
   g_free (vsp_info->dev_name[CAP]);
 
+  g_free (space->vsp_info->clut_addr);
   g_free (space->vsp_info);
 
   G_OBJECT_CLASS (parent_class)->finalize (obj);
@@ -1867,6 +2058,9 @@ gst_vsp_filter_init (GstVspFilter * space)
   vsp_info->CProps.hue_offset = DEFAULT_HUE_OFFSET;
   vsp_info->CProps.saturation_offset = DEFAULT_SATURATION_OFFSET;
   vsp_info->CProps.brightness_offset = DEFAULT_BRIGHTNESS_OFFSET;
+  vsp_info->CProps.update_cprops = TRUE;
+
+  vsp_info->clut_addr = g_malloc0 (RCAR_CLU_NUM * sizeof(guint64));
 
   space->vsp_info = vsp_info;
 }
@@ -2122,6 +2316,14 @@ gst_vsp_filter_transform_frame_process (GstVideoFilter * filter,
           out_stride, out_vframe_info->io != V4L2_MEMORY_MMAP, io)) {
     GST_ERROR_OBJECT (space, "set_vsp_entities failed");
     return GST_FLOW_ERROR;
+  }
+
+  if (vsp_info->CProps.update_cprops) {
+    if (!set_clu_matrix (space)) {
+      GST_ERROR_OBJECT (space, "set_clu_matrix failed");
+      return GST_FLOW_ERROR;
+    }
+    vsp_info->CProps.update_cprops = FALSE;
   }
 
   /* set up planes for queuing input buffers */
