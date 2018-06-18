@@ -84,6 +84,12 @@ typedef struct CpropCaps_t
   gint max;
 }CpropCaps;
 
+#define NUM_SCALE_FACTORS_IMX6   3
+#define CSC_NORM_VALUE 256
+#define CSC_MAX_VALUE 255
+
+static const unsigned int valid_scale_factors[NUM_SCALE_FACTORS_IMX6] = {1, 2, 4};
+
 /*Insert enums carefully between PROP_HUE and PROP_BRIGHTNESS_OFFSET
  * as it is used as an array index*/
 static const CpropCaps color_prop_caps[(PROP_BRIGHTNESS_OFFSET - PROP_HUE) + 1] =
@@ -699,6 +705,32 @@ init_entity_pad (GstVspFilter * space, gint fd, gint index, guint pad,
 }
 
 static gboolean
+init_clu_entity_pad (GstVspFilter * space, gint fd, guint pad,
+    guint width, guint height, guint code)
+{
+  struct v4l2_subdev_format sfmt;
+
+  CLEAR (sfmt);
+
+  sfmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+  sfmt.pad = pad;
+  sfmt.format.width = width;
+  sfmt.format.height = height;
+  sfmt.format.code = code;
+  sfmt.format.field = V4L2_FIELD_NONE;
+  sfmt.format.colorspace = V4L2_COLORSPACE_SRGB;
+
+
+  if (-1 == xioctl (fd, VIDIOC_SUBDEV_S_FMT, &sfmt)) {
+    GST_ERROR_OBJECT (space, "VIDIOC_SUBDEV_S_FMT for clu entity failed. fd:%d",
+        fd);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
 get_wpf_output_entity_name (GstVspFilter * space, gchar * wpf_output_name,
     size_t maxlen)
 {
@@ -821,11 +853,15 @@ set_clu_matrix (GstVspFilter * space)
 
   type = get_csc_type(space, vsp_info->format[CAP], vsp_info->format[OUT]);
 
+  fprintf(stderr,"%s %d> csc_type:%d sat_offset:%d\n", __FUNCTION__, __LINE__, type,
+		  vsp_info->CProps.saturation_offset);
+
   csc_GetTransformationMatrix(0, type, &vsp_info->CProps, trnfmat);
 
   for (i = 0; i < 3; i++) {
     for (j = 0; j < 3; j++) {
       //column major
+      fprintf(stderr,"%s %d> trnfmat[%d][%d]:%f\n", __FUNCTION__, __LINE__,j,i,trnfmat[j][i]);
       coefficients[k] = trnfmat[j][i];
       ++k;
     }
@@ -845,15 +881,19 @@ set_clu_matrix (GstVspFilter * space)
           ((guint32) (((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5])) + 0.5) << 8) |
           ((guint32) ( (r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5) );
 
+        //clu_color = 0xffffffff;
+
         *(clut_addr) = (guint64)clu_color;
+        fprintf(stderr,"%s %d> clu_color:0x%x\n", __FUNCTION__, __LINE__,clu_color);
         clut_addr++;
       }
     }
   }
 
   clu_config.addr = vsp_info->clut_addr;
-  clu_config.mode = 0 /*VSP_CLU_MODE_3D*/;
+  clu_config.mode = 0x80 /*VSP_CLU_MODE_3D_AUTO*/;
   clu_config.tbl_num = RCAR_CLU_NUM;
+  clu_config.fxa = 255;
 
   if (-1 == ioctl (vsp_info->clu_subdev_fd, VIDIOC_VSP2_CLU_CONFIG, &clu_config)) {
     GST_ERROR_OBJECT (space, "VIDIOC_VSP2_CLU_CONFIG failed");
@@ -902,20 +942,6 @@ set_clu_entity (GstVspFilter * space, const gchar *clu_entity_name,
 
   GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
     vsp_info->entity_name[OUT], clu_entity_name);
-
-  /*sink pad*/
-  if (!init_entity_pad (space, vsp_info->clu_subdev_fd, CLU, 0, in_width,
-      in_height, vsp_info->code[OUT])) {
-    GST_ERROR_OBJECT (space, "init_entity_pad failed");
-    return FALSE;
-  }
-
-  /*source pad*/
-  if (!init_entity_pad (space, vsp_info->clu_subdev_fd, CLU, 1, out_width,
-      out_height, vsp_info->code[CAP])) {
-    GST_ERROR_OBJECT (space, "init_entity_pad failed");
-    return FALSE;
-  }
 
   return TRUE;
 }
@@ -1012,6 +1038,9 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     return FALSE;
   }
 
+  fprintf(stderr, "in_format:%d out_format:%d\n",
+		  in_fmt, out_fmt);
+
   GST_DEBUG_OBJECT (space,
       "in_info->width=%d in_info->height=%d out_info->width=%d out_info->height=%d",
       in_width, in_height, out_width, out_height);
@@ -1090,6 +1119,9 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     GST_ERROR_OBJECT (space, "get_wpf_output_entity_name failed");
     return FALSE;
   }
+
+  fprintf(stderr,"wpf_output_entity_name:%s\n", tmp);
+
   ret = get_media_entity (space, tmp, &vsp_info->entity[4]);
   ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[4]);
   if (ret) {
@@ -1101,6 +1133,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   GST_DEBUG_OBJECT (space,
       "%s has been linked as the terminal of the entities link", tmp);
 
+
   /* sink pad in RPF */
   if (!init_entity_pad (space, vsp_info->v4lsub_fd[OUT], OUT, 0, in_width,
           in_height, vsp_info->code[OUT])) {
@@ -1109,7 +1142,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   }
   /* source pad in RPF */
   if (!init_entity_pad (space, vsp_info->v4lsub_fd[OUT], OUT, 1, in_width,
-          in_height, vsp_info->code[OUT])) {
+          in_height, vsp_info->code[CAP])) {
     GST_ERROR_OBJECT (space, "init_entity_pad failed");
     return FALSE;
   }
@@ -1122,6 +1155,20 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   /* source pad in WPF */
   if (!init_entity_pad (space, vsp_info->v4lsub_fd[CAP], CAP, 1, out_width,
           out_height, vsp_info->code[CAP])) {
+    GST_ERROR_OBJECT (space, "init_entity_pad failed");
+    return FALSE;
+  }
+
+  /*sink pad*/
+  if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 0, in_width,
+      in_height, vsp_info->code[CAP])) {
+    GST_ERROR_OBJECT (space, "init_entity_pad failed");
+    return FALSE;
+  }
+
+  /*source pad*/
+  if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 1, in_width,
+      in_height, vsp_info->code[CAP])) {
     GST_ERROR_OBJECT (space, "init_entity_pad failed");
     return FALSE;
   }
@@ -1376,6 +1423,11 @@ gst_vsp_filter_vsp_device_deinit (GstVspFilter * space)
   if (vsp_info->resz_subdev_fd >= 0) {
     close (vsp_info->resz_subdev_fd);
     vsp_info->resz_subdev_fd = -1;
+  }
+
+  if (vsp_info->clu_subdev_fd >= 0) {
+    close (vsp_info->clu_subdev_fd);
+    vsp_info->clu_subdev_fd = -1;
   }
 
   close (vsp_info->v4lsub_fd[OUT]);
@@ -2050,6 +2102,7 @@ gst_vsp_filter_init (GstVspFilter * space)
   vsp_info->dev_name[CAP] = g_strdup (DEFAULT_PROP_VSP_DEVFILE_OUTPUT);
 
   vsp_info->resz_subdev_fd = -1;
+  vsp_info->clu_subdev_fd = -1;
 
   vsp_info->CProps.hue  = DEFAULT_HUE;
   vsp_info->CProps.saturation = DEFAULT_SATURATION;
