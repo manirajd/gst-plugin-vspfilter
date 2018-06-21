@@ -87,6 +87,8 @@ typedef struct CpropCaps_t
 #define NUM_SCALE_FACTORS_IMX6   3
 #define CSC_NORM_VALUE 256
 #define CSC_MAX_VALUE 255
+#define CSC_COMP_MIN_VALUE 0
+#define CSC_COMP_MAX_VALUE 255
 
 static const unsigned int valid_scale_factors[NUM_SCALE_FACTORS_IMX6] = {1, 2, 4};
 
@@ -771,60 +773,57 @@ leave:
 }
 
 static enum csc_type
-get_csc_type (GstVspFilter * space, guint src_format, guint sink_format)
+get_csc_type (GstVspFilter * space, guint src_format)
 {
   enum csc_type csc_conversion;
 
-  GST_DEBUG_OBJECT(space, "src_format: %d, sink_format:%d\n", src_format, sink_format);
+  GST_DEBUG_OBJECT(space, "src_format:%d\n", src_format);
 
-  if (((V4L2_PIX_FMT_YUV420M == src_format)
-      || (V4L2_PIX_FMT_NV12M == src_format)
-      || (V4L2_PIX_FMT_NV21M == src_format)
-      || (V4L2_PIX_FMT_NV16M == src_format)
-      || (V4L2_PIX_FMT_UYVY == src_format)
-      || (V4L2_PIX_FMT_YUYV == src_format)) &&
-      ((V4L2_PIX_FMT_RGB565 == sink_format)
-      || (V4L2_PIX_FMT_RGB24 == sink_format)
-      || (V4L2_PIX_FMT_BGR24 == sink_format)
-      || (V4L2_PIX_FMT_ARGB32 == sink_format)
-      || (V4L2_PIX_FMT_XRGB32 == sink_format)
-      || (V4L2_PIX_FMT_ABGR32 == sink_format)
-      || (V4L2_PIX_FMT_XBGR32 == sink_format)))
-  {
-    csc_conversion = CSC_RGB2YUV;
-  }
-  else if(((V4L2_PIX_FMT_YUV420M == sink_format)
-          || (V4L2_PIX_FMT_NV12M == sink_format)
-          || (V4L2_PIX_FMT_NV21M == sink_format)
-          || (V4L2_PIX_FMT_NV16M == sink_format)
-          || (V4L2_PIX_FMT_UYVY == sink_format)
-          || (V4L2_PIX_FMT_YUYV == sink_format)) &&
-          ((V4L2_PIX_FMT_RGB565 == src_format)
-          || (V4L2_PIX_FMT_RGB24 == src_format)
-          || (V4L2_PIX_FMT_BGR24 == src_format)
-          || (V4L2_PIX_FMT_ARGB32 == src_format)
-          || (V4L2_PIX_FMT_XRGB32 == src_format)
-          || (V4L2_PIX_FMT_ABGR32 == src_format)
-          || (V4L2_PIX_FMT_XBGR32 == src_format)))
-  {
-    csc_conversion = CSC_YUV2RGB;
-  }
-  else if ((V4L2_PIX_FMT_RGB565 == src_format)
-           || (V4L2_PIX_FMT_RGB24 == src_format)
-           || (V4L2_PIX_FMT_BGR24 == src_format)
-           || (V4L2_PIX_FMT_ARGB32 == src_format)
-           || (V4L2_PIX_FMT_XRGB32 == src_format)
-           || (V4L2_PIX_FMT_ABGR32 == src_format)
-           || (V4L2_PIX_FMT_XBGR32 == src_format))
+  if ((V4L2_PIX_FMT_RGB565 == src_format)
+      || (V4L2_PIX_FMT_RGB24 == src_format)
+      || (V4L2_PIX_FMT_BGR24 == src_format)
+      || (V4L2_PIX_FMT_ARGB32 == src_format)
+      || (V4L2_PIX_FMT_XRGB32 == src_format)
+      || (V4L2_PIX_FMT_ABGR32 == src_format)
+      || (V4L2_PIX_FMT_XBGR32 == src_format))
   {
     csc_conversion = CSC_RGB2RGB;
   }
-  else
+  else if((V4L2_PIX_FMT_YUV420M == src_format)
+          || (V4L2_PIX_FMT_NV12M == src_format)
+          || (V4L2_PIX_FMT_NV21M == src_format)
+          || (V4L2_PIX_FMT_NV16M == src_format)
+          || (V4L2_PIX_FMT_UYVY == src_format)
+          || (V4L2_PIX_FMT_YUYV == src_format))
   {
     csc_conversion = CSC_YUV2YUV;
   }
+  else
+  {
+    csc_conversion = CSC_RGB2RGB;
+    GST_ERROR_OBJECT (space, "unknown source format");
+  }
 
   return csc_conversion;
+}
+
+static void
+clamp_rgb_values (gint32 *red, gint32 *green, gint32 *blue)
+{
+  if (*red < CSC_COMP_MIN_VALUE)
+    *red = CSC_COMP_MIN_VALUE;
+  else if (*red > CSC_COMP_MAX_VALUE)
+    *red = CSC_COMP_MAX_VALUE;
+
+  if (*green < CSC_COMP_MIN_VALUE)
+    *green = CSC_COMP_MIN_VALUE;
+  else if (*green > CSC_COMP_MAX_VALUE)
+    *green = CSC_COMP_MAX_VALUE;
+
+  if (*blue < CSC_COMP_MIN_VALUE)
+    *blue = CSC_COMP_MIN_VALUE;
+  else if (*blue > CSC_COMP_MAX_VALUE)
+    *blue = CSC_COMP_MAX_VALUE;
 }
 
 static gboolean
@@ -841,8 +840,8 @@ set_clu_matrix (GstVspFilter * space)
   uint32_t r_value;
   uint32_t g_value;
   uint32_t b_value;
-  uint32_t clu_color;
-  guint64* clut_addr;
+  unsigned int clu_color;
+  unsigned int* clut_addr;
   struct vsp2_clu_config clu_config = {0};
   float trnfmat[4][4]= {{1.0, 0.0, 0.0, 0.0},
                         {0.0, 1.0, 0.0, 0.0},
@@ -851,41 +850,75 @@ set_clu_matrix (GstVspFilter * space)
 
   vsp_info = space->vsp_info;
 
-  type = get_csc_type(space, vsp_info->format[CAP], vsp_info->format[OUT]);
+  type = get_csc_type(space, vsp_info->format[CAP]);
 
-  fprintf(stderr,"%s %d> csc_type:%d sat_offset:%d\n", __FUNCTION__, __LINE__, type,
-		  vsp_info->CProps.saturation_offset);
+  GST_DEBUG_OBJECT(space," CLU table csc_type:%d\n",type);
 
-  csc_GetTransformationMatrix(0, type, &vsp_info->CProps, trnfmat);
+  GST_DEBUG_OBJECT(space,"hue:%d saturation:%d brightness:%d contrast:%d"
+		  " hue_off:%d saturation_off:%d brightness_off:%d\n",
+		  vsp_info->CProps.hue, vsp_info->CProps.saturation,
+		  vsp_info->CProps.brightness, vsp_info->CProps.contrast,
+		  vsp_info->CProps.hue_offset, vsp_info->CProps.saturation_offset,
+		  vsp_info->CProps.brightness_offset);
+
+  csc_GetTransformationMatrix(0, type, &vsp_info->CProps, (float*)trnfmat);
 
   for (i = 0; i < 3; i++) {
     for (j = 0; j < 3; j++) {
       //column major
-      fprintf(stderr,"%s %d> trnfmat[%d][%d]:%f\n", __FUNCTION__, __LINE__,j,i,trnfmat[j][i]);
+      GST_DEBUG_OBJECT(space,"trnfmat[%d][%d]:%f\n", j,i,trnfmat[j][i]);
       coefficients[k] = trnfmat[j][i];
       ++k;
     }
   }
 
-  clut_addr = vsp_info->clut_addr;
+  GST_DEBUG_OBJECT(space,"offset[0]:%f, offset[1]:%f, offset[2]:%f\n",
+      trnfmat[3][0], trnfmat[3][1], trnfmat[3][2]);
+
+  clut_addr = (unsigned int*)vsp_info->clut_addr;
+
+  k = 0;
 
   for (b_loop = 0; b_loop < RCAR_CLU_NUM_PER_COLOR; b_loop++) {
     for (g_loop = 0; g_loop < RCAR_CLU_NUM_PER_COLOR; g_loop++) {
       for (r_loop = 0; r_loop < RCAR_CLU_NUM_PER_COLOR; r_loop++) {
+        gint32 red = 0;
+        gint32 green = 0;
+        gint32 blue = 0;
+
         r_value = (r_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : r_loop * 16;
         g_value = (g_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : g_loop * 16;
         b_value = (b_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : b_loop * 16;
 
-        clu_color =
-          (guint32)( ((r_value*coefficients[0]) + (g_value*coefficients[1]) + (b_value*coefficients[2])) + 0.5) << 16 |
-          ((guint32) (((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5])) + 0.5) << 8) |
-          ((guint32) ( (r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5) );
-
-        //clu_color = 0xffffffff;
-
-        *(clut_addr) = (guint64)clu_color;
-        fprintf(stderr,"%s %d> clu_color:0x%x\n", __FUNCTION__, __LINE__,clu_color);
+        *clut_addr = 0x00007404;
         clut_addr++;
+
+        /* For YUV CLUT, we have to consider R->Cr, G->Y, B->Cb*/
+        if (type == CSC_YUV2YUV) {
+          green = (gint32)(((g_value*coefficients[0]) + (b_value*coefficients[1]) + (r_value*coefficients[2])) + 0.5);
+          blue = (gint32)(((g_value*coefficients[3]) + (b_value*coefficients[4]) + (r_value*coefficients[5])) + 0.5);
+          red = (gint32)((g_value*coefficients[6]) + (b_value*coefficients[7]) + (r_value*coefficients[8]) + 0.5);
+
+          green += trnfmat[3][0];
+          blue += trnfmat[3][1];
+          red += trnfmat[3][2];
+        }
+        else {
+          red = (gint32)((r_value*coefficients[0]) + (g_value*coefficients[1]) + (b_value*coefficients[2]) + 0.5);
+          green = (gint32)((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5]) + 0.5);
+          blue = (gint32)((r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5);
+        }
+
+        clamp_rgb_values(&red, &green, &blue);
+
+        clu_color = (red << 16) | (green << 8) | blue;
+
+        GST_DEBUG_OBJECT(space,"index:%d red:0x%x green:0x%x blue:0x%x clu_color:0x%x\n", k, red, green, blue, clu_color);
+
+        *(clut_addr) = clu_color;
+        clut_addr++;
+
+        k++;
       }
     }
   }
@@ -893,7 +926,6 @@ set_clu_matrix (GstVspFilter * space)
   clu_config.addr = vsp_info->clut_addr;
   clu_config.mode = 0x80 /*VSP_CLU_MODE_3D_AUTO*/;
   clu_config.tbl_num = RCAR_CLU_NUM;
-  clu_config.fxa = 255;
 
   if (-1 == ioctl (vsp_info->clu_subdev_fd, VIDIOC_VSP2_CLU_CONFIG, &clu_config)) {
     GST_ERROR_OBJECT (space, "VIDIOC_VSP2_CLU_CONFIG failed");
@@ -1038,9 +1070,6 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     return FALSE;
   }
 
-  fprintf(stderr, "in_format:%d out_format:%d\n",
-		  in_fmt, out_fmt);
-
   GST_DEBUG_OBJECT (space,
       "in_info->width=%d in_info->height=%d out_info->width=%d out_info->height=%d",
       in_width, in_height, out_width, out_height);
@@ -1119,8 +1148,6 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     GST_ERROR_OBJECT (space, "get_wpf_output_entity_name failed");
     return FALSE;
   }
-
-  fprintf(stderr,"wpf_output_entity_name:%s\n", tmp);
 
   ret = get_media_entity (space, tmp, &vsp_info->entity[4]);
   ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[4]);
