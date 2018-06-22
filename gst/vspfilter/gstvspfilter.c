@@ -2165,8 +2165,12 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
 {
   GstVspFilter *space;
   GstVspFilterVspInfo *vsp_info;
+  GstVideoFilterClass *fclass;
+  GstVideoFilter *filter;
 
   space = GST_VSP_FILTER (object);
+  filter = GST_VIDEO_FILTER_CAST (space);
+  fclass = GST_VIDEO_FILTER_GET_CLASS (filter);
   vsp_info = space->vsp_info;
 
   switch (property_id) {
@@ -2230,6 +2234,19 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
   if ((property_id >= PROP_HUE) && (property_id <= PROP_BRIGHTNESS_OFFSET))
   {
       vsp_info->CProps.update_cprops = TRUE;
+
+      if ((TRUE == GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps)
+          && ((DEFAULT_HUE != vsp_info->CProps.hue)
+          || (DEFAULT_SATURATION != vsp_info->CProps.saturation)
+          || (DEFAULT_BRIGHTNESS != vsp_info->CProps.brightness)
+          || (DEFAULT_CONTRAST != vsp_info->CProps.contrast)
+          || (DEFAULT_HUE_OFFSET != vsp_info->CProps.hue_offset)
+          || (DEFAULT_SATURATION_OFFSET != vsp_info->CProps.saturation_offset)
+          || (DEFAULT_BRIGHTNESS_OFFSET != vsp_info->CProps.brightness_offset)))
+      {
+        GST_DEBUG_OBJECT (space, "passthrough_on_same_caps is set to FALSE\n");
+        GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps = FALSE;
+      }
   }
 }
 
