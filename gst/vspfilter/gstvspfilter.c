@@ -772,6 +772,18 @@ leave:
   return ret;
 }
 
+static gboolean
+is_csc_color_parameter_default(ColorProps *pCprops)
+{
+  return ((DEFAULT_HUE == pCprops->hue)
+      && (DEFAULT_SATURATION == pCprops->saturation)
+      && (DEFAULT_BRIGHTNESS == pCprops->brightness)
+      && (DEFAULT_CONTRAST == pCprops->contrast)
+      && (DEFAULT_HUE_OFFSET == pCprops->hue_offset)
+      && (DEFAULT_SATURATION_OFFSET == pCprops->saturation_offset)
+      && (DEFAULT_BRIGHTNESS_OFFSET == pCprops->brightness_offset));
+}
+
 static enum csc_type
 get_csc_type (GstVspFilter * space, guint src_format)
 {
@@ -1063,11 +1075,13 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   /* Deactivate the current pipeline. */
   deactivate_link (space, &vsp_info->entity[OUT]);
 
-  ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
-          out_width, out_height);
-  if (FALSE == ret) {
-    GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
-    return FALSE;
+  if (!is_csc_color_parameter_default(&vsp_info->CProps)) {
+    ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
+            out_width, out_height);
+    if (FALSE == ret) {
+      GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
+      return FALSE;
+    }
   }
 
   GST_DEBUG_OBJECT (space,
@@ -1096,17 +1110,35 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
       return FALSE;
     }
     GST_DEBUG_OBJECT (space, "A entity for %s found.", resz_entity_name);
-    ret =
-        activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[RESZ]);
-    if (ret) {
-      GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+
+    /*link CLU -> RESZ if clu is needed*/
+    if (vsp_info->clu_subdev_fd != -1) {
+      ret =
+          activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[RESZ]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            clu_entity_name, resz_entity_name);
+        return FALSE;
+      }
+
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
           clu_entity_name, resz_entity_name);
-      return FALSE;
+    }
+    else {
+      ret =
+          activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[RESZ]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            vsp_info->entity_name[OUT], resz_entity_name);
+        return FALSE;
+      }
+
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          vsp_info->entity_name[OUT], resz_entity_name);
     }
 
-    GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        clu_entity_name, resz_entity_name);
 
+    /*link RESZ -> CAP*/
     ret =
         activate_link (space, &vsp_info->entity[RESZ], &vsp_info->entity[CAP]);
     if (ret) {
@@ -1134,14 +1166,27 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
       vsp_info->resz_subdev_fd = -1;
     }
 
-    ret = activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[CAP]);
-    if (ret) {
-      GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
-          vsp_info->entity_name[CLU], vsp_info->entity_name[CAP]);
-      return FALSE;
+    /*link CLU -> CAP if clu is needed*/
+    if (vsp_info->clu_subdev_fd != -1) {
+      ret = activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[CAP]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            clu_entity_name, vsp_info->entity_name[CAP]);
+        return FALSE;
+      }
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          clu_entity_name, vsp_info->entity_name[CAP]);
     }
-    GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        vsp_info->entity_name[CLU], vsp_info->entity_name[CAP]);
+    else {
+      ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CAP]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+        return FALSE;
+      }
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+    }
   }
 
   if (!get_wpf_output_entity_name (space, tmp, sizeof (tmp))) {
@@ -1186,18 +1231,21 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     return FALSE;
   }
 
-  /*sink pad*/
-  if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 0, in_width,
-      in_height, vsp_info->code[CAP])) {
-    GST_ERROR_OBJECT (space, "init_entity_pad failed");
-    return FALSE;
-  }
+  /*init CLU entity pads if CLU is needed*/
+  if (vsp_info->clu_subdev_fd != -1) {
+    /*sink pad*/
+    if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 0, in_width,
+        in_height, vsp_info->code[CAP])) {
+      GST_ERROR_OBJECT (space, "init_entity_pad failed");
+      return FALSE;
+    }
 
-  /*source pad*/
-  if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 1, in_width,
-      in_height, vsp_info->code[CAP])) {
-    GST_ERROR_OBJECT (space, "init_entity_pad failed");
-    return FALSE;
+    /*source pad*/
+    if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 1, in_width,
+        in_height, vsp_info->code[CAP])) {
+      GST_ERROR_OBJECT (space, "init_entity_pad failed");
+      return FALSE;
+    }
   }
 
   vsp_info->already_setup_info = TRUE;
@@ -2236,13 +2284,7 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
       vsp_info->CProps.update_cprops = TRUE;
 
       if ((TRUE == GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps)
-          && ((DEFAULT_HUE != vsp_info->CProps.hue)
-          || (DEFAULT_SATURATION != vsp_info->CProps.saturation)
-          || (DEFAULT_BRIGHTNESS != vsp_info->CProps.brightness)
-          || (DEFAULT_CONTRAST != vsp_info->CProps.contrast)
-          || (DEFAULT_HUE_OFFSET != vsp_info->CProps.hue_offset)
-          || (DEFAULT_SATURATION_OFFSET != vsp_info->CProps.saturation_offset)
-          || (DEFAULT_BRIGHTNESS_OFFSET != vsp_info->CProps.brightness_offset)))
+          && !is_csc_color_parameter_default(&vsp_info->CProps))
       {
         GST_DEBUG_OBJECT (space, "passthrough_on_same_caps is set to FALSE\n");
         GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps = FALSE;
@@ -2415,7 +2457,7 @@ gst_vsp_filter_transform_frame_process (GstVideoFilter * filter,
     return GST_FLOW_ERROR;
   }
 
-  if (vsp_info->CProps.update_cprops) {
+  if (vsp_info->CProps.update_cprops && (vsp_info->clu_subdev_fd != -1)) {
     if (!set_clu_matrix (space)) {
       GST_ERROR_OBJECT (space, "set_clu_matrix failed");
       return GST_FLOW_ERROR;
