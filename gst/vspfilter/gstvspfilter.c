@@ -1075,13 +1075,11 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   /* Deactivate the current pipeline. */
   deactivate_link (space, &vsp_info->entity[OUT]);
 
-  if (!is_csc_color_parameter_default(&vsp_info->CProps)) {
-    ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
-            out_width, out_height);
-    if (FALSE == ret) {
-      GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
-      return FALSE;
-    }
+  ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
+          out_width, out_height);
+  if (FALSE == ret) {
+    GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
+    return FALSE;
   }
 
   GST_DEBUG_OBJECT (space,
@@ -1582,6 +1580,32 @@ gst_vsp_filter_setup_pool (gint fd, enum v4l2_buf_type buftype, GstCaps * caps,
   return pool;
 }
 
+static GstFlowReturn
+gst_vsp_filter_prepare_output_buffer (GstBaseTransform * trans,
+    GstBuffer * inbuf, GstBuffer ** outbuf)
+{
+  GstVspFilter *space;
+  GstVspFilterVspInfo *vsp_info;
+  GstVideoFilter *filter = GST_VIDEO_FILTER_CAST (trans);
+
+  space = GST_VSP_FILTER_CAST (trans);
+  vsp_info = space->vsp_info;
+
+  /*check passthrough*/
+  if ((filter->in_info.finfo->format == filter->out_info.finfo->format) &&
+      (filter->in_info.width == filter->out_info.width) &&
+      (filter->in_info.height == filter->out_info.height) &&
+      is_csc_color_parameter_default(&vsp_info->CProps))
+  {
+    GST_DEBUG_OBJECT (space,"passthrough mode, outbuf is set as inbuf\n");
+    *outbuf = inbuf;
+    return GST_FLOW_OK;
+  }
+
+  return GST_BASE_TRANSFORM_CLASS (parent_class)->prepare_output_buffer (trans,
+		  inbuf, outbuf);
+}
+
 /* configure the allocation query that was answered downstream, we can configure
  * some properties on it. Only called when not in passthrough mode. */
 static gboolean
@@ -1827,6 +1851,15 @@ gst_vsp_filter_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     goto unknown_format;
 
   space = GST_VSP_FILTER_CAST (filter);
+
+  /* prepare_output_buffer checks for passthrough
+   * and sets the input buffer as output buffer.
+   * In this case we can skip the transform */
+  if (inbuf == outbuf)
+  {
+    GST_DEBUG_OBJECT (space, "in passthrough mode\n");
+    return GST_FLOW_OK;
+  }
 
   in_n_mem = gst_buffer_n_memory (inbuf);
   out_n_mem = gst_buffer_n_memory (outbuf);
@@ -2158,7 +2191,13 @@ gst_vsp_filter_class_init (GstVspFilterClass * klass)
   gstbasetransform_class->stop =
       GST_DEBUG_FUNCPTR (gst_vsp_filter_stop);
 
-  gstbasetransform_class->passthrough_on_same_caps = TRUE;
+  /* decide passthrough on our own by
+   * using prepare_output_buffer, because hue, saturation,
+   * brightness poperties can be changed dynamically */
+  gstbasetransform_class->prepare_output_buffer =
+      GST_DEBUG_FUNCPTR (gst_vsp_filter_prepare_output_buffer);
+
+  gstbasetransform_class->passthrough_on_same_caps = FALSE;
 }
 
 static void
@@ -2282,13 +2321,6 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
   if ((property_id >= PROP_HUE) && (property_id <= PROP_BRIGHTNESS_OFFSET))
   {
       vsp_info->CProps.update_cprops = TRUE;
-
-      if ((TRUE == GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps)
-          && !is_csc_color_parameter_default(&vsp_info->CProps))
-      {
-        GST_DEBUG_OBJECT (space, "passthrough_on_same_caps is set to FALSE\n");
-        GST_BASE_TRANSFORM_CLASS (fclass)->passthrough_on_same_caps = FALSE;
-      }
   }
 }
 
@@ -2458,6 +2490,14 @@ gst_vsp_filter_transform_frame_process (GstVideoFilter * filter,
   }
 
   if (vsp_info->CProps.update_cprops && (vsp_info->clu_subdev_fd != -1)) {
+    if (vsp_info->is_stream_started) {
+      stop_capturing (space, vsp_info->v4lout_fd, OUT,
+        V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+      stop_capturing (space, vsp_info->v4lcap_fd, CAP,
+        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+      vsp_info->is_stream_started = FALSE;
+    }
+
     if (!set_clu_matrix (space)) {
       GST_ERROR_OBJECT (space, "set_clu_matrix failed");
       return GST_FLOW_ERROR;
