@@ -14,7 +14,8 @@ libgstvspfilter_la_LIBADD = \
 	$(GST_VIDEO_LIBS) \
 	$(GST_ALLOCATORS_LIBS) \
 	$(GST_BASE_LIBS) \
-	$(GST_LIBS)
+	$(GST_LIBS) \
+	-lcsc-matrix
 libgstvspfilter_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
 
 noinst_HEADERS = \

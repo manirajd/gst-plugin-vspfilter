@@ -58,6 +58,23 @@ G_DEFINE_TYPE (GstVspFilter, gst_vsp_filter, GST_TYPE_VIDEO_FILTER);
 #define DEFAULT_VFLIP FALSE
 #define DEFAULT_HFLIP FALSE
 
+/*TODO: Need to remove the CLU reg, CLU ioctl dependencies*/
+#define CLU_DATA_REG_OFFSET 0x00007404
+#define VIDIOC_VSP2_CLU_CONFIG \
+  _IOWR('V', BASE_VIDIOC_PRIVATE + 2, struct vsp2_clu_config)
+/*
+ * mode = VSP_CLU_MODE_3D      -> tbl_num = 2 to 9826
+ * mode = VSP_CLU_MODE_2D      -> tbl_num = 2 to 578
+ * mode = VSP_CLU_MODE_3D_AUTO -> tbl_num = 1 to 4913
+ * mode = VSP_CLU_MODE_2D_AUTO -> tbl_num = 1 to 289
+ */
+struct vsp2_clu_config {
+  unsigned char	mode;
+  void *addr; /* Allocate memory size is tbl_num * 8 bytes. */
+  unsigned char fxa;
+  unsigned short tbl_num; /* 1 to 9826 */
+};
+
 enum
 {
   PROP_0,
@@ -67,6 +84,38 @@ enum
   PROP_OUTPUT_IO_MODE,
   PROP_VFLIP,
   PROP_HFLIP,
+  PROP_HUE,
+  PROP_SATURATION,
+  PROP_BRIGHTNESS,
+  PROP_CONTRAST,
+  PROP_HUE_OFFSET,
+  PROP_SATURATION_OFFSET,
+  PROP_BRIGHTNESS_OFFSET,
+};
+
+typedef struct CpropCaps_t
+{
+  gint min;
+  gint max;
+}CpropCaps;
+
+#define NUM_SCALE_FACTORS_IMX6   3
+#define CSC_NORM_VALUE 256
+#define CSC_MAX_VALUE 255
+#define CSC_COMP_MIN_VALUE 0
+#define CSC_COMP_MAX_VALUE 255
+
+/*Insert enums carefully between PROP_HUE and PROP_BRIGHTNESS_OFFSET
+ * as it is used as an array index*/
+static const CpropCaps color_prop_caps[(PROP_BRIGHTNESS_OFFSET - PROP_HUE) + 1] =
+{
+  {-180, 180},
+  {0, 200},
+  {0, 200},
+  {0, 200},
+  {-180, 180},
+  {0, 100},
+  {-100, 100}
 };
 
 #define CSP_VIDEO_CAPS \
@@ -671,6 +720,32 @@ init_entity_pad (GstVspFilter * space, gint fd, gint index, guint pad,
 }
 
 static gboolean
+init_clu_entity_pad (GstVspFilter * space, gint fd, guint pad,
+    guint width, guint height, guint code)
+{
+  struct v4l2_subdev_format sfmt;
+
+  CLEAR (sfmt);
+
+  sfmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+  sfmt.pad = pad;
+  sfmt.format.width = width;
+  sfmt.format.height = height;
+  sfmt.format.code = code;
+  sfmt.format.field = V4L2_FIELD_NONE;
+  sfmt.format.colorspace = V4L2_COLORSPACE_SRGB;
+
+
+  if (-1 == xioctl (fd, VIDIOC_SUBDEV_S_FMT, &sfmt)) {
+    GST_ERROR_OBJECT (space, "VIDIOC_SUBDEV_S_FMT for clu entity failed. fd:%d",
+        fd);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
 get_wpf_output_entity_name (GstVspFilter * space, gchar * wpf_output_name,
     size_t maxlen)
 {
@@ -711,6 +786,228 @@ leave:
 }
 
 static gboolean
+is_csc_color_parameter_default(ColorProps *pCprops)
+{
+  return ((DEFAULT_HUE == pCprops->hue)
+      && (DEFAULT_SATURATION == pCprops->saturation)
+      && (DEFAULT_BRIGHTNESS == pCprops->brightness)
+      && (DEFAULT_CONTRAST == pCprops->contrast)
+      && (DEFAULT_HUE_OFFSET == pCprops->hue_offset)
+      && (DEFAULT_SATURATION_OFFSET == pCprops->saturation_offset)
+      && (DEFAULT_BRIGHTNESS_OFFSET == pCprops->brightness_offset));
+}
+
+static enum csc_type
+get_csc_type (GstVspFilter * space, guint src_format)
+{
+  enum csc_type csc_conversion;
+
+  GST_DEBUG_OBJECT(space, "src_format:%d\n", src_format);
+
+  if ((V4L2_PIX_FMT_RGB565 == src_format)
+      || (V4L2_PIX_FMT_RGB24 == src_format)
+      || (V4L2_PIX_FMT_BGR24 == src_format)
+      || (V4L2_PIX_FMT_ARGB32 == src_format)
+      || (V4L2_PIX_FMT_XRGB32 == src_format)
+      || (V4L2_PIX_FMT_ABGR32 == src_format)
+      || (V4L2_PIX_FMT_XBGR32 == src_format))
+  {
+    csc_conversion = CSC_RGB2RGB;
+  }
+  else if((V4L2_PIX_FMT_YUV420M == src_format)
+          || (V4L2_PIX_FMT_NV12M == src_format)
+          || (V4L2_PIX_FMT_NV21M == src_format)
+          || (V4L2_PIX_FMT_NV16M == src_format)
+          || (V4L2_PIX_FMT_UYVY == src_format)
+          || (V4L2_PIX_FMT_YUYV == src_format))
+  {
+    csc_conversion = CSC_YUV2YUV;
+  }
+  else
+  {
+    csc_conversion = CSC_RGB2RGB;
+    GST_ERROR_OBJECT (space, "unknown source format");
+  }
+
+  return csc_conversion;
+}
+
+static void
+clamp_rgb_values (gint32 *red, gint32 *green, gint32 *blue)
+{
+  if (*red < CSC_COMP_MIN_VALUE)
+    *red = CSC_COMP_MIN_VALUE;
+  else if (*red > CSC_COMP_MAX_VALUE)
+    *red = CSC_COMP_MAX_VALUE;
+
+  if (*green < CSC_COMP_MIN_VALUE)
+    *green = CSC_COMP_MIN_VALUE;
+  else if (*green > CSC_COMP_MAX_VALUE)
+    *green = CSC_COMP_MAX_VALUE;
+
+  if (*blue < CSC_COMP_MIN_VALUE)
+    *blue = CSC_COMP_MIN_VALUE;
+  else if (*blue > CSC_COMP_MAX_VALUE)
+    *blue = CSC_COMP_MAX_VALUE;
+}
+
+static gboolean
+set_clu_matrix (GstVspFilter * space)
+{
+  GstVspFilterVspInfo *vsp_info;
+
+  enum csc_type type;
+  float coefficients[9];
+  int i,j,k=0;
+  int b_loop;
+  int g_loop;
+  int r_loop;
+  uint32_t r_value;
+  uint32_t g_value;
+  uint32_t b_value;
+  unsigned int clu_color;
+  unsigned int* clut_addr;
+  struct vsp2_clu_config clu_config = {0};
+  float trnfmat[4][4]= {{1.0, 0.0, 0.0, 0.0},
+                        {0.0, 1.0, 0.0, 0.0},
+                        {0.0, 0.0, 1.0, 0.0},
+                        {0.0, 0.0, 0.0, 1.0}};
+
+  vsp_info = space->vsp_info;
+
+  type = get_csc_type(space, vsp_info->format[CAP]);
+
+  GST_DEBUG_OBJECT(space," CLU table csc_type:%d\n",type);
+
+  GST_DEBUG_OBJECT(space,"hue:%d saturation:%d brightness:%d contrast:%d"
+		  " hue_off:%d saturation_off:%d brightness_off:%d\n",
+		  vsp_info->CProps.hue, vsp_info->CProps.saturation,
+		  vsp_info->CProps.brightness, vsp_info->CProps.contrast,
+		  vsp_info->CProps.hue_offset, vsp_info->CProps.saturation_offset,
+		  vsp_info->CProps.brightness_offset);
+
+  csc_GetTransformationMatrix(0, type, &vsp_info->CProps, (float*)trnfmat);
+
+  for (i = 0; i < 3; i++) {
+    for (j = 0; j < 3; j++) {
+      //column major
+      GST_DEBUG_OBJECT(space,"trnfmat[%d][%d]:%f\n", j,i,trnfmat[j][i]);
+      coefficients[k] = trnfmat[j][i];
+      ++k;
+    }
+  }
+
+  GST_DEBUG_OBJECT(space,"offset[0]:%f, offset[1]:%f, offset[2]:%f\n",
+      trnfmat[3][0], trnfmat[3][1], trnfmat[3][2]);
+
+  clut_addr = (unsigned int*)vsp_info->clut_addr;
+
+  k = 0;
+
+  for (b_loop = 0; b_loop < RCAR_CLU_NUM_PER_COLOR; b_loop++) {
+    for (g_loop = 0; g_loop < RCAR_CLU_NUM_PER_COLOR; g_loop++) {
+      for (r_loop = 0; r_loop < RCAR_CLU_NUM_PER_COLOR; r_loop++) {
+        gint32 red = 0;
+        gint32 green = 0;
+        gint32 blue = 0;
+
+        r_value = (r_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : r_loop * 16;
+        g_value = (g_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : g_loop * 16;
+        b_value = (b_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : b_loop * 16;
+
+        *clut_addr = 0x00007404;
+        clut_addr++;
+
+        /* For YUV CLUT, we have to consider R->Cr, G->Y, B->Cb*/
+        if (type == CSC_YUV2YUV) {
+          green = (gint32)(((g_value*coefficients[0]) + (b_value*coefficients[1]) + (r_value*coefficients[2])) + 0.5);
+          blue = (gint32)(((g_value*coefficients[3]) + (b_value*coefficients[4]) + (r_value*coefficients[5])) + 0.5);
+          red = (gint32)((g_value*coefficients[6]) + (b_value*coefficients[7]) + (r_value*coefficients[8]) + 0.5);
+
+          green += trnfmat[3][0];
+          blue += trnfmat[3][1];
+          red += trnfmat[3][2];
+        }
+        else {
+          red = (gint32)((r_value*coefficients[0]) + (g_value*coefficients[1]) + (b_value*coefficients[2]) + 0.5);
+          green = (gint32)((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5]) + 0.5);
+          blue = (gint32)((r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5);
+
+          red += trnfmat[3][0];
+          green += trnfmat[3][1];
+          blue += trnfmat[3][2];
+        }
+
+        clamp_rgb_values(&red, &green, &blue);
+
+        clu_color = (red << 16) | (green << 8) | blue;
+
+        GST_DEBUG_OBJECT(space,"index:%d red:0x%x green:0x%x blue:0x%x clu_color:0x%x\n", k, red, green, blue, clu_color);
+
+        *(clut_addr) = clu_color;
+        clut_addr++;
+
+        k++;
+      }
+    }
+  }
+
+  clu_config.addr = vsp_info->clut_addr;
+  clu_config.mode = 0x80 /*VSP_CLU_MODE_3D_AUTO*/;
+  clu_config.tbl_num = RCAR_CLU_NUM;
+
+  if (-1 == ioctl (vsp_info->clu_subdev_fd, VIDIOC_VSP2_CLU_CONFIG, &clu_config)) {
+    GST_ERROR_OBJECT (space, "VIDIOC_VSP2_CLU_CONFIG failed");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+set_clu_entity (GstVspFilter * space, const gchar *clu_entity_name,
+                gint in_width, gint in_height,
+                gint out_width, gint out_height)
+{
+  GstVspFilterVspInfo *vsp_info;
+  gchar path[256];
+  gchar tmp[256];
+  gint ret;
+
+  vsp_info = space->vsp_info;
+
+  if (vsp_info->clu_subdev_fd < 0) {
+    vsp_info->clu_subdev_fd =
+        open_v4lsubdev (vsp_info->ip_name, clu_entity_name, path);
+    if (vsp_info->clu_subdev_fd < 0) {
+      GST_ERROR_OBJECT (space, "cannot open a subdev file for %s",
+          clu_entity_name);
+      return FALSE;
+    }
+  }
+
+  sprintf (tmp, "%s %s", vsp_info->ip_name, clu_entity_name);
+  ret = get_media_entity (space, tmp, &vsp_info->entity[CLU]);
+  if (ret < 0) {
+    GST_ERROR_OBJECT (space, "Entity for %s not found.", clu_entity_name);
+    return FALSE;
+  }
+  GST_DEBUG_OBJECT (space, "A entity for %s found.", clu_entity_name);
+
+  ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CLU]);
+  if (ret) {
+    GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+        vsp_info->entity_name[OUT], clu_entity_name);
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+    vsp_info->entity_name[OUT], clu_entity_name);
+
+  return TRUE;
+}
+
+static gboolean
 set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
     gint in_height, gint in_stride[GST_VIDEO_MAX_PLANES],
     gboolean need_in_setfmt, GstVideoFormat out_fmt, gint out_width,
@@ -721,6 +1018,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   gint ret;
   gchar tmp[256];
   guint n_bufs;
+  const gchar *clu_entity_name = "clu";
 
   vsp_info = space->vsp_info;
 
@@ -794,6 +1092,13 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   /* Deactivate the current pipeline. */
   deactivate_link (space, &vsp_info->entity[OUT]);
 
+  ret = set_clu_entity (space, clu_entity_name, in_width, in_height,
+          out_width, out_height);
+  if (FALSE == ret) {
+    GST_ERROR_OBJECT (space, "set_clu_entity %s failed", clu_entity_name);
+    return FALSE;
+  }
+
   GST_DEBUG_OBJECT (space,
       "in_info->width=%d in_info->height=%d out_info->width=%d out_info->height=%d",
       in_width, in_height, out_width, out_height);
@@ -820,17 +1125,35 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
       return FALSE;
     }
     GST_DEBUG_OBJECT (space, "A entity for %s found.", resz_entity_name);
-    ret =
-        activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[RESZ]);
-    if (ret) {
-      GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+
+    /*link CLU -> RESZ if clu is needed*/
+    if (vsp_info->clu_subdev_fd != -1) {
+      ret =
+          activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[RESZ]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            clu_entity_name, resz_entity_name);
+        return FALSE;
+      }
+
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          clu_entity_name, resz_entity_name);
+    }
+    else {
+      ret =
+          activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[RESZ]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            vsp_info->entity_name[OUT], resz_entity_name);
+        return FALSE;
+      }
+
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
           vsp_info->entity_name[OUT], resz_entity_name);
-      return FALSE;
     }
 
-    GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        vsp_info->entity_name[OUT], resz_entity_name);
 
+    /*link RESZ -> CAP*/
     ret =
         activate_link (space, &vsp_info->entity[RESZ], &vsp_info->entity[CAP]);
     if (ret) {
@@ -858,22 +1181,36 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
       vsp_info->resz_subdev_fd = -1;
     }
 
-    ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CAP]);
-    if (ret) {
-      GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
-          vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
-      return FALSE;
+    /*link CLU -> CAP if clu is needed*/
+    if (vsp_info->clu_subdev_fd != -1) {
+      ret = activate_link (space, &vsp_info->entity[CLU], &vsp_info->entity[CAP]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            clu_entity_name, vsp_info->entity_name[CAP]);
+        return FALSE;
+      }
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          clu_entity_name, vsp_info->entity_name[CAP]);
     }
-    GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
-        vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+    else {
+      ret = activate_link (space, &vsp_info->entity[OUT], &vsp_info->entity[CAP]);
+      if (ret) {
+        GST_ERROR_OBJECT (space, "Cannot enable a link from %s to %s",
+            vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+        return FALSE;
+      }
+      GST_DEBUG_OBJECT (space, "A link from %s to %s enabled.",
+          vsp_info->entity_name[OUT], vsp_info->entity_name[CAP]);
+    }
   }
 
   if (!get_wpf_output_entity_name (space, tmp, sizeof (tmp))) {
     GST_ERROR_OBJECT (space, "get_wpf_output_entity_name failed");
     return FALSE;
   }
-  ret = get_media_entity (space, tmp, &vsp_info->entity[3]);
-  ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[3]);
+
+  ret = get_media_entity (space, tmp, &vsp_info->entity[4]);
+  ret = activate_link (space, &vsp_info->entity[CAP], &vsp_info->entity[4]);
   if (ret) {
     GST_ERROR_OBJECT (space,
         "Cannot enable a link from %s to vsp1.2 wpf.0 output",
@@ -882,6 +1219,7 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
   }
   GST_DEBUG_OBJECT (space,
       "%s has been linked as the terminal of the entities link", tmp);
+
 
   /* sink pad in RPF */
   if (!init_entity_pad (space, vsp_info->v4lsub_fd[OUT], OUT, 0, in_width,
@@ -906,6 +1244,23 @@ set_vsp_entities (GstVspFilter * space, GstVideoFormat in_fmt, gint in_width,
           out_height, vsp_info->code[CAP])) {
     GST_ERROR_OBJECT (space, "init_entity_pad failed");
     return FALSE;
+  }
+
+  /*init CLU entity pads if CLU is needed*/
+  if (vsp_info->clu_subdev_fd != -1) {
+    /*sink pad*/
+    if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 0, in_width,
+        in_height, vsp_info->code[CAP])) {
+      GST_ERROR_OBJECT (space, "init_entity_pad failed");
+      return FALSE;
+    }
+
+    /*source pad*/
+    if (!init_clu_entity_pad (space, vsp_info->clu_subdev_fd, 1, in_width,
+        in_height, vsp_info->code[CAP])) {
+      GST_ERROR_OBJECT (space, "init_entity_pad failed");
+      return FALSE;
+    }
   }
 
   vsp_info->already_setup_info = TRUE;
@@ -954,6 +1309,7 @@ gst_vsp_filter_finalize (GObject * obj)
   g_free (vsp_info->dev_name[OUT]);
   g_free (vsp_info->dev_name[CAP]);
 
+  g_free (space->vsp_info->clut_addr);
   g_free (space->vsp_info);
 
   G_OBJECT_CLASS (parent_class)->finalize (obj);
@@ -1159,6 +1515,11 @@ gst_vsp_filter_vsp_device_deinit (GstVspFilter * space)
     vsp_info->resz_subdev_fd = -1;
   }
 
+  if (vsp_info->clu_subdev_fd >= 0) {
+    close (vsp_info->clu_subdev_fd);
+    vsp_info->clu_subdev_fd = -1;
+  }
+
   close (vsp_info->v4lsub_fd[OUT]);
   close (vsp_info->v4lsub_fd[CAP]);
 
@@ -1234,6 +1595,32 @@ gst_vsp_filter_setup_pool (gint fd, enum v4l2_buf_type buftype, GstCaps * caps,
   }
 
   return pool;
+}
+
+static GstFlowReturn
+gst_vsp_filter_prepare_output_buffer (GstBaseTransform * trans,
+    GstBuffer * inbuf, GstBuffer ** outbuf)
+{
+  GstVspFilter *space;
+  GstVspFilterVspInfo *vsp_info;
+  GstVideoFilter *filter = GST_VIDEO_FILTER_CAST (trans);
+
+  space = GST_VSP_FILTER_CAST (trans);
+  vsp_info = space->vsp_info;
+
+  /*check passthrough*/
+  if ((filter->in_info.finfo->format == filter->out_info.finfo->format) &&
+      (filter->in_info.width == filter->out_info.width) &&
+      (filter->in_info.height == filter->out_info.height) &&
+      is_csc_color_parameter_default(&vsp_info->CProps))
+  {
+    GST_DEBUG_OBJECT (space,"passthrough mode, outbuf is set as inbuf\n");
+    *outbuf = inbuf;
+    return GST_FLOW_OK;
+  }
+
+  return GST_BASE_TRANSFORM_CLASS (parent_class)->prepare_output_buffer (trans,
+		  inbuf, outbuf);
 }
 
 /* configure the allocation query that was answered downstream, we can configure
@@ -1482,6 +1869,15 @@ gst_vsp_filter_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
   space = GST_VSP_FILTER_CAST (filter);
 
+  /* prepare_output_buffer checks for passthrough
+   * and sets the input buffer as output buffer.
+   * In this case we can skip the transform */
+  if (inbuf == outbuf)
+  {
+    GST_DEBUG_OBJECT (space, "in passthrough mode\n");
+    return GST_FLOW_OK;
+  }
+
   in_n_mem = gst_buffer_n_memory (inbuf);
   out_n_mem = gst_buffer_n_memory (outbuf);
 
@@ -1728,6 +2124,48 @@ gst_vsp_filter_class_init (GstVspFilterClass * klass)
           GST_TYPE_VSPFILTER_IO_MODE, DEFAULT_PROP_IO_MODE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_HUE,
+      g_param_spec_int("hue", "hue",
+          "color space rotation angle",
+          color_prop_caps[0].min, color_prop_caps[0].max, DEFAULT_HUE,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_SATURATION,
+      g_param_spec_int("saturation", "saturation",
+          "saturation as defined by HSV color space",
+          color_prop_caps[1].min, color_prop_caps[1].max, DEFAULT_SATURATION,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_BRIGHTNESS,
+      g_param_spec_int("brightness", "brightness",
+          "Brightness as defined by value in HSV color space",
+          color_prop_caps[2].min, color_prop_caps[2].max, DEFAULT_BRIGHTNESS,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_CONTRAST,
+      g_param_spec_int("contrast", "contrast",
+          "contrast is the extent one can distinguish colors",
+          color_prop_caps[3].min, color_prop_caps[3].max, DEFAULT_CONTRAST,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_HUE_OFFSET,
+      g_param_spec_int("hue offset", "hue offset",
+          "hue value for the color offset which is added to each pixel",
+          color_prop_caps[4].min, color_prop_caps[4].max, DEFAULT_HUE_OFFSET,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_SATURATION_OFFSET,
+      g_param_spec_int("saturation offset", "saturation offset",
+          "saturation value for the color offset which is added to each pixel",
+          color_prop_caps[5].min, color_prop_caps[5].max, DEFAULT_SATURATION_OFFSET,
+          G_PARAM_READWRITE));
+
+  g_object_class_install_property (gobject_class, PROP_BRIGHTNESS_OFFSET,
+      g_param_spec_int("brightness offset", "brightness offset",
+          "brightness value for the color offset which is added to each pixel",
+          color_prop_caps[6].min, color_prop_caps[6].max, DEFAULT_BRIGHTNESS_OFFSET,
+          G_PARAM_READWRITE));
+
   g_object_class_install_property (gobject_class, PROP_VFLIP,
          g_param_spec_boolean("vflip", "vflip",
              "Perform vertical flip (around X axis)",
@@ -1770,7 +2208,13 @@ gst_vsp_filter_class_init (GstVspFilterClass * klass)
   gstbasetransform_class->stop =
       GST_DEBUG_FUNCPTR (gst_vsp_filter_stop);
 
-  gstbasetransform_class->passthrough_on_same_caps = TRUE;
+  /* decide passthrough on our own by
+   * using prepare_output_buffer, because hue, saturation,
+   * brightness poperties can be changed dynamically */
+  gstbasetransform_class->prepare_output_buffer =
+      GST_DEBUG_FUNCPTR (gst_vsp_filter_prepare_output_buffer);
+
+  gstbasetransform_class->passthrough_on_same_caps = FALSE;
 }
 
 static void
@@ -1789,8 +2233,34 @@ gst_vsp_filter_init (GstVspFilter * space)
   vsp_info->dev_name[CAP] = g_strdup (DEFAULT_PROP_VSP_DEVFILE_OUTPUT);
 
   vsp_info->resz_subdev_fd = -1;
+  vsp_info->clu_subdev_fd = -1;
+
+  vsp_info->CProps.hue  = DEFAULT_HUE;
+  vsp_info->CProps.saturation = DEFAULT_SATURATION;
+  vsp_info->CProps.brightness = DEFAULT_BRIGHTNESS;
+  vsp_info->CProps.contrast = DEFAULT_CONTRAST;
+  vsp_info->CProps.hue_offset = DEFAULT_HUE_OFFSET;
+  vsp_info->CProps.saturation_offset = DEFAULT_SATURATION_OFFSET;
+  vsp_info->CProps.brightness_offset = DEFAULT_BRIGHTNESS_OFFSET;
+  vsp_info->CProps.update_cprops = TRUE;
+
+  vsp_info->clut_addr = g_malloc0 (RCAR_CLU_NUM * sizeof(guint64));
 
   space->vsp_info = vsp_info;
+}
+
+static gint gst_v4l_csc_get_capped_color_prop(gint property, gint value)
+{
+  gint ret = value;
+  if (value < color_prop_caps[property - PROP_HUE].min)
+  {
+    ret = color_prop_caps[property - PROP_HUE].min;
+  }
+  if (value > color_prop_caps[property - PROP_HUE].max)
+  {
+    ret = color_prop_caps[property - PROP_HUE].max;
+  }
+  return ret;
 }
 
 static void
@@ -1799,8 +2269,12 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
 {
   GstVspFilter *space;
   GstVspFilterVspInfo *vsp_info;
+  GstVideoFilterClass *fclass;
+  GstVideoFilter *filter;
 
   space = GST_VSP_FILTER (object);
+  filter = GST_VIDEO_FILTER_CAST (space);
+  fclass = GST_VIDEO_FILTER_GET_CLASS (filter);
   vsp_info = space->vsp_info;
 
   switch (property_id) {
@@ -1828,9 +2302,42 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
     case PROP_HFLIP:
       space->hflip = g_value_get_boolean(value);
       break;
+    case PROP_HUE:
+      vsp_info->CProps.hue = \
+         gst_v4l_csc_get_capped_color_prop(PROP_HUE,g_value_get_int(value));
+      break;
+    case PROP_SATURATION:
+      vsp_info->CProps.saturation = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_SATURATION,g_value_get_int(value));
+      break;
+    case PROP_BRIGHTNESS:
+      vsp_info->CProps.brightness = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_BRIGHTNESS,g_value_get_int(value));
+      break;
+    case PROP_CONTRAST:
+      vsp_info->CProps.contrast = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_CONTRAST,g_value_get_int(value));
+      break;
+    case PROP_HUE_OFFSET:
+      vsp_info->CProps.hue_offset = \
+         gst_v4l_csc_get_capped_color_prop(PROP_HUE_OFFSET,g_value_get_int(value));
+      break;
+    case PROP_SATURATION_OFFSET:
+      vsp_info->CProps.saturation_offset = (guint8)\
+         gst_v4l_csc_get_capped_color_prop(PROP_SATURATION_OFFSET,g_value_get_int(value));
+      break;
+    case PROP_BRIGHTNESS_OFFSET:
+      vsp_info->CProps.brightness_offset = \
+         gst_v4l_csc_get_capped_color_prop(PROP_BRIGHTNESS_OFFSET,g_value_get_int(value));
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
+  }
+
+  if ((property_id >= PROP_HUE) && (property_id <= PROP_BRIGHTNESS_OFFSET))
+  {
+      vsp_info->CProps.update_cprops = TRUE;
   }
 }
 
@@ -1862,6 +2369,27 @@ gst_vsp_filter_get_property (GObject * object, guint property_id,
       break;
     case PROP_HFLIP:
       g_value_set_boolean(value, space->hflip);
+      break;
+    case PROP_HUE:
+      g_value_set_int(value, vsp_info->CProps.hue);
+      break;
+    case PROP_SATURATION:
+      g_value_set_int(value, (gint)vsp_info->CProps.saturation);
+      break;
+    case PROP_BRIGHTNESS:
+      g_value_set_int(value, (gint)vsp_info->CProps.brightness);
+      break;
+    case PROP_CONTRAST:
+      g_value_set_int(value, (gint)vsp_info->CProps.contrast);
+      break;
+    case PROP_HUE_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.hue_offset);
+      break;
+    case PROP_SATURATION_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.saturation_offset);
+      break;
+    case PROP_BRIGHTNESS_OFFSET:
+      g_value_set_int(value, (gint)vsp_info->CProps.brightness_offset);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -1976,6 +2504,22 @@ gst_vsp_filter_transform_frame_process (GstVideoFilter * filter,
           out_stride, out_vframe_info->io != V4L2_MEMORY_MMAP, io)) {
     GST_ERROR_OBJECT (space, "set_vsp_entities failed");
     return GST_FLOW_ERROR;
+  }
+
+  if (vsp_info->CProps.update_cprops && (vsp_info->clu_subdev_fd != -1)) {
+    if (vsp_info->is_stream_started) {
+      stop_capturing (space, vsp_info->v4lout_fd, OUT,
+        V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+      stop_capturing (space, vsp_info->v4lcap_fd, CAP,
+        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+      vsp_info->is_stream_started = FALSE;
+    }
+
+    if (!set_clu_matrix (space)) {
+      GST_ERROR_OBJECT (space, "set_clu_matrix failed");
+      return GST_FLOW_ERROR;
+    }
+    vsp_info->CProps.update_cprops = FALSE;
   }
 
   /* set up planes for queuing input buffers */
