@@ -46,8 +46,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "vsp2.h"
-
 GST_DEBUG_CATEGORY (vspfilter_debug);
 #define GST_CAT_DEFAULT vspfilter_debug
 GST_DEBUG_CATEGORY_EXTERN (GST_CAT_PERFORMANCE);
@@ -920,6 +918,10 @@ set_clu_matrix (GstVspFilter * space)
           red = (gint32)((r_value*coefficients[0]) + (g_value*coefficients[1]) + (b_value*coefficients[2]) + 0.5);
           green = (gint32)((r_value*coefficients[3]) + (g_value*coefficients[4]) + (b_value*coefficients[5]) + 0.5);
           blue = (gint32)((r_value*coefficients[6]) + (g_value*coefficients[7]) + (b_value*coefficients[8]) + 0.5);
+
+          red += trnfmat[3][0];
+          green += trnfmat[3][1];
+          blue += trnfmat[3][2];
         }
 
         clamp_rgb_values(&red, &green, &blue);
@@ -2314,7 +2316,7 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
          gst_v4l_csc_get_capped_color_prop(PROP_CONTRAST,g_value_get_int(value));
       break;
     case PROP_HUE_OFFSET:
-      vsp_info->CProps.hue_offset = (guint8)\
+      vsp_info->CProps.hue_offset = \
          gst_v4l_csc_get_capped_color_prop(PROP_HUE_OFFSET,g_value_get_int(value));
       break;
     case PROP_SATURATION_OFFSET:
@@ -2322,7 +2324,7 @@ gst_vsp_filter_set_property (GObject * object, guint property_id,
          gst_v4l_csc_get_capped_color_prop(PROP_SATURATION_OFFSET,g_value_get_int(value));
       break;
     case PROP_BRIGHTNESS_OFFSET:
-      vsp_info->CProps.brightness_offset = (guint8)\
+      vsp_info->CProps.brightness_offset = \
          gst_v4l_csc_get_capped_color_prop(PROP_BRIGHTNESS_OFFSET,g_value_get_int(value));
       break;
     default:
