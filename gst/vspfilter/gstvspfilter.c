@@ -58,22 +58,9 @@ G_DEFINE_TYPE (GstVspFilter, gst_vsp_filter, GST_TYPE_VIDEO_FILTER);
 #define DEFAULT_VFLIP FALSE
 #define DEFAULT_HFLIP FALSE
 
-/*TODO: Need to remove the CLU reg, CLU ioctl dependencies*/
-#define CLU_DATA_REG_OFFSET 0x00007404
-#define VIDIOC_VSP2_CLU_CONFIG \
-  _IOWR('V', BASE_VIDIOC_PRIVATE + 2, struct vsp2_clu_config)
-/*
- * mode = VSP_CLU_MODE_3D      -> tbl_num = 2 to 9826
- * mode = VSP_CLU_MODE_2D      -> tbl_num = 2 to 578
- * mode = VSP_CLU_MODE_3D_AUTO -> tbl_num = 1 to 4913
- * mode = VSP_CLU_MODE_2D_AUTO -> tbl_num = 1 to 289
- */
-struct vsp2_clu_config {
-  unsigned char	mode;
-  void *addr; /* Allocate memory size is tbl_num * 8 bytes. */
-  unsigned char fxa;
-  unsigned short tbl_num; /* 1 to 9826 */
-};
+#define V4L2_CID_VSP2_CLU_TABLE_ADDRESS (V4L2_CID_USER_BASE | 0x1001)
+#define V4L2_CID_VSP2_CLU_TABLE_NUMBER (V4L2_CID_USER_BASE | 0x1002)
+#define V4L2_CID_VSP2_CLU_MODE  (V4L2_CID_USER_BASE | 0x1003)
 
 enum
 {
@@ -866,12 +853,14 @@ set_clu_matrix (GstVspFilter * space)
   uint32_t g_value;
   uint32_t b_value;
   unsigned int clu_color;
-  unsigned int* clut_addr;
-  struct vsp2_clu_config clu_config = {0};
+  unsigned long* clut_addr;
   float trnfmat[4][4]= {{1.0, 0.0, 0.0, 0.0},
                         {0.0, 1.0, 0.0, 0.0},
                         {0.0, 0.0, 1.0, 0.0},
                         {0.0, 0.0, 0.0, 1.0}};
+  struct v4l2_control ctrl;
+  struct v4l2_ext_controls ctrls_ext = {0};
+  struct v4l2_ext_control ctrl_ext[3] = {0};
 
   vsp_info = space->vsp_info;
 
@@ -900,7 +889,7 @@ set_clu_matrix (GstVspFilter * space)
   GST_DEBUG_OBJECT(space,"offset[0]:%f, offset[1]:%f, offset[2]:%f\n",
       trnfmat[3][0], trnfmat[3][1], trnfmat[3][2]);
 
-  clut_addr = (unsigned int*)vsp_info->clut_addr;
+  clut_addr = vsp_info->clut_addr;
 
   k = 0;
 
@@ -914,9 +903,6 @@ set_clu_matrix (GstVspFilter * space)
         r_value = (r_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : r_loop * 16;
         g_value = (g_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : g_loop * 16;
         b_value = (b_loop == (RCAR_CLU_NUM_PER_COLOR - 1)) ? 255 : b_loop * 16;
-
-        *clut_addr = 0x00007404;
-        clut_addr++;
 
         /* For YUV CLUT, we have to consider R->Cr, G->Y, B->Cb*/
         if (type == CSC_YUV2YUV) {
@@ -952,12 +938,23 @@ set_clu_matrix (GstVspFilter * space)
     }
   }
 
-  clu_config.addr = vsp_info->clut_addr;
-  clu_config.mode = 0x80 /*VSP_CLU_MODE_3D_AUTO*/;
-  clu_config.tbl_num = RCAR_CLU_NUM;
+  ctrls_ext.ctrl_class = V4L2_CTRL_CLASS_USER;
+  ctrls_ext.count = sizeof(ctrl_ext)/sizeof(ctrl_ext[0]);
+  ctrls_ext.controls = ctrl_ext;
 
-  if (-1 == ioctl (vsp_info->clu_subdev_fd, VIDIOC_VSP2_CLU_CONFIG, &clu_config)) {
-    GST_ERROR_OBJECT (space, "VIDIOC_VSP2_CLU_CONFIG failed");
+  ctrl_ext[0].id = V4L2_CID_VSP2_CLU_MODE;
+  ctrl_ext[0].value = 0;
+
+  ctrl_ext[1].id = V4L2_CID_VSP2_CLU_TABLE_ADDRESS;
+  ctrl_ext[1].value64 = (signed long)vsp_info->clut_addr;
+
+  ctrl_ext[2].id = V4L2_CID_VSP2_CLU_TABLE_NUMBER;
+  ctrl_ext[2].value = (signed long)RCAR_CLU_NUM;
+
+  errno = 0;
+  if(-1 == ioctl(vsp_info->clu_subdev_fd, VIDIOC_S_EXT_CTRLS, &ctrls_ext))
+  {
+    GST_ERROR_OBJECT(space, "could not set CLU table Error:%s", strerror(errno));
     return FALSE;
   }
 
